@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "199102790189",
+    "project_id": "sihstudentatendacne",
+    "storage_bucket": "sihstudentatendacne.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:199102790189:android:26fba352447fa43db096a4",
+        "android_client_info": {
+          "package_name": "com.example.attendance_system"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyANS1EmVzDCVA2XL4nOvl5kTKsnMrttIqE"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

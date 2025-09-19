@@ -1,0 +1,9 @@
+Teacher login id's
+email - lagan@gmail.com 
+password - rehyan
+
+email - test@gmail.com
+password - rehyan
+admin login 
+email - admin@admin.com
+password - admin123

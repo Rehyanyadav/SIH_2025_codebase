@@ -1,14 +1,19 @@
 // ignore_for_file: deprecated_member_use, use_build_context_synchronously
 
 import 'package:flutter/material.dart';
-import 'package:mobile_scanner/mobile_scanner.dart';
+import 'package:hive/hive.dart';
+import 'package:hive_flutter/hive_flutter.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
+// import 'dart:convert'; // Unused
+import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/foundation.dart';
+import 'package:mobile_scanner/mobile_scanner.dart' as ms;
 import 'package:google_ml_kit/google_ml_kit.dart';
 import 'dart:io';
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'core/constants.dart';
 import 'core/firebase_service.dart';
 import 'core/auth_service.dart';
 import 'core/test_data.dart';
@@ -17,11 +22,34 @@ import 'presentation/screens/admin_register_screen.dart';
 import 'presentation/screens/splash_screen.dart';
 import 'admin_dashboard_page.dart';
 
+// Conditional import for web CSV download
+import 'web_csv_download_stub.dart'
+    if (dart.library.html) 'web_csv_download.dart';
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await Hive.initFlutter();
+  await Hive.openBox('offline_attendance');
   await FirebaseService.initialize();
-  await seedTestData(); // Seed demo data for testing
+  // await seedTestData(); // Removed: no random attendance in Firebase
+  await syncOfflineAttendance();
   runApp(const AttendanceApp());
+}
+
+Future<void> syncOfflineAttendance() async {
+  final box = Hive.box('offline_attendance');
+  final List list = box.get('records', defaultValue: []) as List;
+  if (list.isNotEmpty) {
+    final connectivity = await Connectivity().checkConnectivity();
+    if (connectivity != ConnectivityResult.none) {
+      for (final record in List<Map>.from(list)) {
+        await FirebaseFirestore.instance
+            .collection('attendance')
+            .add(Map<String, dynamic>.from(record));
+      }
+      await box.put('records', []);
+    }
+  }
 }
 
 class AttendanceApp extends StatelessWidget {
@@ -77,7 +105,7 @@ class AttendanceApp extends StatelessWidget {
         '/dashboard': (context) => const DashboardScreen(),
         '/attendance': (context) => const AttendanceScreen(),
         '/users': (context) => const UserManagementScreen(),
-        '/reports': (context) => const ReportsScreen(),
+        // '/reports': (context) => const ReportsScreen(), // Removed: now requires teacherName
         '/settings': (context) => const SettingsScreen(),
       },
     );
@@ -118,23 +146,41 @@ class _LoginScreenState extends State<LoginScreen> {
     }
     try {
       if (_selectedRole == 'admin') {
-        // Admin login: check Firestore for admin user
-        final user = await AuthService().signIn(
-          _nameController.text,
-          _passwordController.text,
-        );
-        if (user != null && user.role == 'admin') {
+        // Admin login: check for hardcoded admin or Firestore
+        if (_nameController.text == 'admin@admin.com' &&
+            _passwordController.text == 'admin123') {
           Navigator.pushReplacement(
             context,
             MaterialPageRoute(
-              builder: (context) =>
-                  DashboardScreen(userRole: 'admin', userName: user.name),
+              builder: (context) => DashboardScreen(
+                userRole: 'admin',
+                userName: 'Administrator',
+                userEmail: 'admin@admin.com',
+              ),
             ),
           );
         } else {
-          setState(() {
-            _error = 'Invalid admin credentials';
-          });
+          // Try Firestore admin login
+          final user = await AuthService().signIn(
+            _nameController.text,
+            _passwordController.text,
+          );
+          if (user != null && user.role == 'admin') {
+            Navigator.pushReplacement(
+              context,
+              MaterialPageRoute(
+                builder: (context) => DashboardScreen(
+                  userRole: 'admin',
+                  userName: user.name,
+                  userEmail: user.email,
+                ),
+              ),
+            );
+          } else {
+            setState(() {
+              _error = 'Invalid admin credentials';
+            });
+          }
         }
       } else {
         // Teacher: check Firestore for user
@@ -146,8 +192,11 @@ class _LoginScreenState extends State<LoginScreen> {
           Navigator.pushReplacement(
             context,
             MaterialPageRoute(
-              builder: (context) =>
-                  DashboardScreen(userRole: user.role, userName: user.name),
+              builder: (context) => DashboardScreen(
+                userRole: user.role,
+                userName: user.name,
+                userEmail: user.email,
+              ),
             ),
           );
         } else {
@@ -262,10 +311,12 @@ class _LoginScreenState extends State<LoginScreen> {
 class DashboardScreen extends StatelessWidget {
   final String userRole;
   final String userName;
+  final String userEmail;
   const DashboardScreen({
     super.key,
     this.userRole = 'teacher',
     this.userName = '',
+    this.userEmail = '',
   });
 
   String get _roleLabel {
@@ -321,13 +372,28 @@ class DashboardScreen extends StatelessWidget {
               ElevatedButton.icon(
                 icon: const Icon(Icons.check_circle),
                 label: const Text('Mark Attendance'),
-                onPressed: () => Navigator.pushNamed(context, '/attendance'),
+                onPressed: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (context) => AttendanceScreen(
+                      userName: userName,
+                      userRole: userRole,
+                      userEmail: userEmail,
+                    ),
+                  ),
+                ),
               ),
               const SizedBox(height: 16),
               ElevatedButton.icon(
                 icon: const Icon(Icons.bar_chart),
                 label: const Text('View Reports'),
-                onPressed: () => Navigator.pushNamed(context, '/reports'),
+                onPressed: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (context) =>
+                        ReportsScreen(teacherEmail: userEmail),
+                  ),
+                ),
               ),
             ] else if (userRole == 'student') ...[
               ElevatedButton.icon(
@@ -349,22 +415,32 @@ class DashboardScreen extends StatelessWidget {
   }
 }
 
-// --- AttendanceScreen with slot selection ---
+// --- AttendanceScreen ---
 class AttendanceScreen extends StatelessWidget {
   final String userName;
   final String userRole;
+  final String userEmail;
   const AttendanceScreen({
-    super.key,
+    Key? key,
     this.userName = '',
     this.userRole = 'student',
-  });
+    this.userEmail = '',
+  }) : super(key: key);
 
   void _markAttendance(
     BuildContext context,
-    String method, [
-    String slot = '',
-  ]) {
-    AttendanceStore().add(userName, method);
+    String method, {
+    String? scannedUser,
+  }) async {
+    final actualUser = scannedUser ?? userName;
+    AttendanceStore().add(actualUser, method);
+    // Save to Firestore with teacherEmail as the logged-in teacher
+    await FirebaseFirestore.instance.collection('attendance').add({
+      'userName': actualUser, // student roll number
+      'date': DateTime.now().toIso8601String(),
+      'method': method,
+      'teacherEmail': userEmail, // teacher's email for filtering
+    });
     ScaffoldMessenger.of(
       context,
     ).showSnackBar(SnackBar(content: Text('Attendance marked by $method!')));
@@ -388,21 +464,31 @@ class AttendanceScreen extends StatelessWidget {
                     builder: (context) => const BarcodeScannerPage(),
                   ),
                 );
-                if (result == true) _markAttendance(context, 'barcode', '');
+                if (result is String && result.isNotEmpty) {
+                  _markAttendance(context, 'barcode', scannedUser: result);
+                }
               },
             ),
             const SizedBox(height: 24),
             ElevatedButton.icon(
               icon: const Icon(Icons.face_retouching_natural),
-              label: const Text('Face Recognition'),
-              onPressed: () async {
-                final result = await Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (context) => const FaceRecognitionPage(),
+              label: const Text('Face Recognition (Mobile Only)'),
+              onPressed: () {
+                showDialog(
+                  context: context,
+                  builder: (context) => AlertDialog(
+                    title: const Text('Not Supported'),
+                    content: const Text(
+                      'Face recognition is only available on Android/iOS mobile devices.',
+                    ),
+                    actions: [
+                      TextButton(
+                        onPressed: () => Navigator.pop(context),
+                        child: const Text('OK'),
+                      ),
+                    ],
                   ),
                 );
-                if (result == true) _markAttendance(context, 'face', '');
               },
             ),
           ],
@@ -454,6 +540,14 @@ class BarcodeScannerPage extends StatefulWidget {
 class _BarcodeScannerPageState extends State<BarcodeScannerPage> {
   String? barcode;
   bool scanned = false;
+  // Add controller to adjust detection settings
+  final ms.MobileScannerController _controller = ms.MobileScannerController(
+    detectionSpeed: ms.DetectionSpeed.noDuplicates, // More reliable
+    formats: [ms.BarcodeFormat.all], // Accept all barcode types
+    facing: ms.CameraFacing.back,
+    torchEnabled: false,
+    autoStart: true,
+  );
 
   @override
   Widget build(BuildContext context) {
@@ -462,19 +556,21 @@ class _BarcodeScannerPageState extends State<BarcodeScannerPage> {
       body: Column(
         children: [
           Expanded(
-            child: MobileScanner(
-              onDetect: (capture) {
+            child: ms.MobileScanner(
+              controller: _controller,
+              fit: BoxFit.contain,
+              onDetect: (capture) async {
                 final code = capture.barcodes.first.rawValue;
                 if (code != null && !scanned) {
                   setState(() {
                     barcode = code;
                     scanned = true;
                   });
-                  ScaffoldMessenger.of(
-                    context,
-                  ).showSnackBar(SnackBar(content: Text('Barcode: $code')));
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Attendance marked for: $code')),
+                  );
                   Future.delayed(const Duration(milliseconds: 500), () {
-                    Navigator.pop(context, true);
+                    Navigator.pop(context, code); // Return scanned code
                   });
                 }
               },
@@ -488,6 +584,21 @@ class _BarcodeScannerPageState extends State<BarcodeScannerPage> {
                 style: Theme.of(context).textTheme.titleMedium,
               ),
             ),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              IconButton(
+                icon: const Icon(Icons.flash_on),
+                onPressed: () => _controller.toggleTorch(),
+                tooltip: 'Toggle Flash',
+              ),
+              IconButton(
+                icon: const Icon(Icons.cameraswitch),
+                onPressed: () => _controller.switchCamera(),
+                tooltip: 'Switch Camera',
+              ),
+            ],
+          ),
         ],
       ),
     );
@@ -496,14 +607,15 @@ class _BarcodeScannerPageState extends State<BarcodeScannerPage> {
 
 // --- Face Recognition Page (Demo) ---
 class FaceRecognitionPage extends StatefulWidget {
-  const FaceRecognitionPage({super.key});
+  final String userName;
+  FaceRecognitionPage({Key? key, required this.userName}) : super(key: key);
+
   @override
   State<FaceRecognitionPage> createState() => _FaceRecognitionPageState();
 }
 
 class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
   File? _image;
-  String? _result;
   bool detected = false;
 
   @override
@@ -515,28 +627,12 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
 
   Future<void> _pickImage() async {
     final picker = ImagePicker();
-    final picked = await picker.pickImage(source: ImageSource.camera);
-    if (picked != null) {
-      setState(() => _image = File(picked.path));
-      await _detectFaces(File(picked.path));
-    }
-  }
-
-  Future<void> _detectFaces(File imageFile) async {
-    final inputImage = InputImage.fromFile(imageFile);
-    final faceDetector = GoogleMlKit.vision.faceDetector();
-    final faces = await faceDetector.processImage(inputImage);
-    setState(() {
-      _result = faces.isNotEmpty
-          ? 'Face(s) detected: ${faces.length}'
-          : 'No face detected.';
-      detected = faces.isNotEmpty;
-    });
-    faceDetector.close();
-    if (detected) {
-      Future.delayed(const Duration(milliseconds: 500), () {
-        Navigator.pop(context, true);
+    final pickedFile = await picker.pickImage(source: ImageSource.camera);
+    if (pickedFile != null) {
+      setState(() {
+        _image = File(pickedFile.path);
       });
+      // Here you would add face recognition logic
     }
   }
 
@@ -548,18 +644,14 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            _image != null
-                ? Image.file(_image!, width: 200)
-                : const Icon(Icons.face, size: 100),
-            const SizedBox(height: 16),
-            ElevatedButton(
+            ElevatedButton.icon(
+              icon: const Icon(Icons.camera_alt),
+              label: const Text('Take Photo'),
               onPressed: _pickImage,
-              child: const Text('Capture Face'),
             ),
-            if (_result != null) ...[
-              const SizedBox(height: 16),
-              Text(_result!, style: Theme.of(context).textTheme.titleMedium),
-            ],
+            const SizedBox(height: 24),
+            if (_image != null) Image.file(_image!, width: 200, height: 200),
+            if (_image == null) const Text('No image selected.'),
           ],
         ),
       ),
@@ -567,260 +659,343 @@ class _FaceRecognitionPageState extends State<FaceRecognitionPage> {
   }
 }
 
+// --- User Management Screen ---
 class UserManagementScreen extends StatelessWidget {
-  const UserManagementScreen({super.key});
+  const UserManagementScreen({Key? key}) : super(key: key);
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('User Management')),
-      body: FutureBuilder<QuerySnapshot>(
-        future: FirebaseFirestore.instance
-            .collection('users')
-            .where('role', isEqualTo: 'teacher')
-            .get(),
-        builder: (context, snapshot) {
-          if (snapshot.connectionState == ConnectionState.waiting) {
-            return const Center(child: CircularProgressIndicator());
-          }
-          if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
-            return const Center(child: Text('No teachers found.'));
-          }
-          final teachers = snapshot.data!.docs;
-          return ListView.separated(
-            itemCount: teachers.length,
-            separatorBuilder: (_, __) => const Divider(),
-            itemBuilder: (context, i) {
-              final doc = teachers[i];
-              return ListTile(
-                title: Text(doc['name'] ?? ''),
-                subtitle: Text(doc['email'] ?? ''),
-                trailing: IconButton(
-                  icon: const Icon(Icons.delete, color: Colors.red),
-                  onPressed: () async {
-                    final confirm = await showDialog<bool>(
-                      context: context,
-                      builder: (ctx) => AlertDialog(
-                        title: const Text('Delete Teacher'),
-                        content: Text(
-                          'Are you sure you want to delete ${doc['name']}?',
-                        ),
-                        actions: [
-                          TextButton(
-                            onPressed: () => Navigator.pop(ctx, false),
-                            child: const Text('Cancel'),
-                          ),
-                          TextButton(
-                            onPressed: () => Navigator.pop(ctx, true),
-                            child: const Text('Delete'),
-                          ),
-                        ],
-                      ),
-                    );
-                    if (confirm == true) {
-                      await FirebaseFirestore.instance
-                          .collection('users')
-                          .doc(doc.id)
-                          .delete();
-                      Navigator.pop(context);
-                      Navigator.pushNamed(context, '/users');
-                    }
-                  },
-                ),
-              );
-            },
-          );
-        },
-      ),
+      body: const Center(child: Text('User management features go here.')),
     );
   }
 }
 
-class ReportsScreen extends StatelessWidget {
-  Future<void> _exportCSV(BuildContext context) async {
-    final records = AttendanceStore().all();
-    final buffer = StringBuffer();
-    buffer.writeln('Name,Date,Method');
-    for (final r in records) {
-      buffer.writeln(
-        '"${r.userName}","${r.date.toIso8601String()}","${r.method}"',
-      );
-    }
-    final csv = buffer.toString();
+// --- Reports Screen ---
+class ReportsScreen extends StatefulWidget {
+  final String teacherEmail;
+  const ReportsScreen({Key? key, required this.teacherEmail}) : super(key: key);
+
+  @override
+  State<ReportsScreen> createState() => _ReportsScreenState();
+}
+
+class _ReportsScreenState extends State<ReportsScreen> {
+  List<Map<String, dynamic>> _allRecords = [];
+  List<Map<String, dynamic>> _filteredRecords = [];
+  String _filterDate = '';
+  String _searchRollNo = '';
+  bool _isLoading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _fetchTeacherAttendance();
+  }
+
+  Future<void> _fetchTeacherAttendance() async {
+    setState(() => _isLoading = true);
     try {
-      final dir = await getTemporaryDirectory();
-      final file = File('${dir.path}/attendance_export.csv');
-      await file.writeAsString(csv);
-      await Share.shareXFiles([
-        XFile(file.path),
-      ], text: 'Attendance Data Export');
+      final query = await FirebaseFirestore.instance
+          .collection('attendance')
+          .where('teacherEmail', isEqualTo: widget.teacherEmail)
+          .get();
+
+      _allRecords = query.docs
+          .map((doc) => {...doc.data(), 'id': doc.id})
+          .toList();
+
+      // Sort by date in memory instead of in Firestore query
+      _allRecords.sort((a, b) {
+        try {
+          final dateA = DateTime.parse(a['date'] ?? '');
+          final dateB = DateTime.parse(b['date'] ?? '');
+          return dateB.compareTo(dateA); // descending order (newest first)
+        } catch (_) {
+          return 0;
+        }
+      });
+
+      _applyFilters();
     } catch (e) {
       ScaffoldMessenger.of(
         context,
-      ).showSnackBar(SnackBar(content: Text('Export failed: $e')));
+      ).showSnackBar(SnackBar(content: Text('Error fetching data: $e')));
+    } finally {
+      setState(() => _isLoading = false);
     }
   }
 
-  final String userName;
-  final String userRole;
-  const ReportsScreen({
-    super.key,
-    this.userName = '',
-    this.userRole = 'student',
-  });
+  void _applyFilters() {
+    setState(() {
+      _filteredRecords = _allRecords.where((record) {
+        // Filter by date
+        if (_filterDate.isNotEmpty) {
+          try {
+            final recordDate = DateTime.parse(record['date']);
+            final filterDate = DateTime.parse(_filterDate);
+            if (recordDate.year != filterDate.year ||
+                recordDate.month != filterDate.month ||
+                recordDate.day != filterDate.day) {
+              return false;
+            }
+          } catch (_) {
+            return false;
+          }
+        }
+
+        // Filter by roll number
+        if (_searchRollNo.isNotEmpty) {
+          final userName = record['userName']?.toString().toLowerCase() ?? '';
+          if (!userName.contains(_searchRollNo.toLowerCase())) {
+            return false;
+          }
+        }
+
+        return true;
+      }).toList();
+    });
+  }
+
+  String _formatDateTime(String? dateStr) {
+    if (dateStr == null) return 'Unknown';
+    try {
+      final dt = DateTime.parse(dateStr);
+      return '${dt.day.toString().padLeft(2, '0')}-${dt.month.toString().padLeft(2, '0')}-${dt.year} ${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+    } catch (_) {
+      return dateStr;
+    }
+  }
+
+  Future<void> _deleteAttendance(String recordId, String studentName) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Delete Attendance'),
+        content: Text(
+          'Are you sure you want to delete the attendance record for "$studentName"?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: TextButton.styleFrom(foregroundColor: Colors.red),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true) {
+      try {
+        await FirebaseFirestore.instance
+            .collection('attendance')
+            .doc(recordId)
+            .delete();
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Attendance record for "$studentName" deleted'),
+            backgroundColor: Colors.green,
+          ),
+        );
+
+        // Refresh the data
+        _fetchTeacherAttendance();
+      } catch (e) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to delete record: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
+  Future<void> _downloadCsv() async {
+    final buffer = StringBuffer();
+    buffer.writeln('Roll Number,Date,Time,Method');
+    for (final r in _filteredRecords) {
+      final dateTime = _formatDateTime(r['date']);
+      buffer.writeln('"${r['userName']}","$dateTime","${r['method']}"');
+    }
+    final csv = buffer.toString();
+
+    if (kIsWeb) {
+      downloadCsvWeb(csv, 'attendance_${widget.teacherEmail}_export.csv');
+    } else {
+      try {
+        final dir = await getTemporaryDirectory();
+        final file = File(
+          '${dir.path}/attendance_${widget.teacherEmail}_export.csv',
+        );
+        await file.writeAsString(csv);
+        await Share.shareXFiles([
+          XFile(file.path),
+        ], text: 'Attendance Data Export');
+      } catch (e) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Export failed: $e')));
+      }
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Attendance Reports'),
-        actions: [
-          if (userRole == 'admin' || userRole == 'teacher')
-            IconButton(
-              icon: const Icon(Icons.download),
-              tooltip: 'Export CSV',
-              onPressed: () => _exportCSV(context),
+      appBar: AppBar(title: const Text('Attendance Reports'), elevation: 2),
+      body: Column(
+        children: [
+          // Filters Section
+          Container(
+            padding: const EdgeInsets.all(16),
+            color: Theme.of(context).cardColor,
+            child: Column(
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        decoration: const InputDecoration(
+                          labelText: 'Search Roll Number',
+                          prefixIcon: Icon(Icons.search),
+                          border: OutlineInputBorder(),
+                        ),
+                        onChanged: (value) {
+                          _searchRollNo = value;
+                          _applyFilters();
+                        },
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: TextField(
+                        decoration: const InputDecoration(
+                          labelText: 'Filter by Date (YYYY-MM-DD)',
+                          prefixIcon: Icon(Icons.calendar_today),
+                          border: OutlineInputBorder(),
+                        ),
+                        onChanged: (value) {
+                          _filterDate = value;
+                          _applyFilters();
+                        },
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    ElevatedButton.icon(
+                      icon: const Icon(Icons.refresh),
+                      label: const Text('Refresh'),
+                      onPressed: _fetchTeacherAttendance,
+                    ),
+                    const SizedBox(width: 12),
+                    ElevatedButton.icon(
+                      icon: const Icon(Icons.download),
+                      label: const Text('Download CSV'),
+                      onPressed: _filteredRecords.isNotEmpty
+                          ? _downloadCsv
+                          : null,
+                    ),
+                    const Spacer(),
+                    Text('Total: ${_filteredRecords.length} records'),
+                  ],
+                ),
+              ],
             ),
-        ],
-      ),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: userRole == 'admin'
-            ? Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  FutureBuilder<QuerySnapshot>(
-                    future: FirebaseFirestore.instance
-                        .collection('users')
-                        .where('role', isEqualTo: 'student')
-                        .get(),
-                    builder: (context, studentSnap) {
-                      if (studentSnap.connectionState ==
-                          ConnectionState.waiting) {
-                        return const Center(child: CircularProgressIndicator());
-                      }
-                      final students = studentSnap.data?.docs ?? [];
+          ),
+
+          // Content Section
+          Expanded(
+            child: _isLoading
+                ? const Center(child: CircularProgressIndicator())
+                : _filteredRecords.isEmpty
+                ? Center(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(
+                          Icons.assignment_outlined,
+                          size: 64,
+                          color: Colors.grey[400],
+                        ),
+                        const SizedBox(height: 16),
+                        Text(
+                          _allRecords.isEmpty
+                              ? 'No attendance records found for your account'
+                              : 'No records match your current filters',
+                          style: Theme.of(context).textTheme.titleMedium,
+                          textAlign: TextAlign.center,
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          _allRecords.isEmpty
+                              ? 'Start taking attendance to see reports here'
+                              : 'Try adjusting your search criteria',
+                          style: Theme.of(context).textTheme.bodyMedium
+                              ?.copyWith(color: Colors.grey[600]),
+                          textAlign: TextAlign.center,
+                        ),
+                      ],
+                    ),
+                  )
+                : ListView.builder(
+                    padding: const EdgeInsets.all(16),
+                    itemCount: _filteredRecords.length,
+                    itemBuilder: (context, index) {
+                      final record = _filteredRecords[index];
+                      final isBarcode = (record['method'] ?? '') == 'barcode';
+                      final recordId = record['id'] ?? '';
+                      final studentName = record['userName'] ?? 'Unknown';
+
                       return Card(
-                        color: Colors.teal.shade50,
-                        child: Padding(
-                          padding: const EdgeInsets.all(16),
-                          child: Column(
+                        margin: const EdgeInsets.only(bottom: 8),
+                        child: ListTile(
+                          leading: CircleAvatar(
+                            backgroundColor: isBarcode
+                                ? Colors.blue
+                                : Colors.green,
+                            child: Icon(
+                              isBarcode ? Icons.qr_code : Icons.face,
+                              color: Colors.white,
+                            ),
+                          ),
+                          title: Text(
+                            'Roll No: $studentName',
+                            style: const TextStyle(fontWeight: FontWeight.bold),
+                          ),
+                          subtitle: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
                               Text(
-                                'Total Students: ${students.length}',
-                                style: const TextStyle(
-                                  fontWeight: FontWeight.bold,
-                                ),
+                                'Date & Time: ${_formatDateTime(record['date'])}',
                               ),
-                              const SizedBox(height: 16),
-                              ElevatedButton.icon(
-                                icon: const Icon(Icons.bar_chart),
-                                label: const Text('Analytics & Reports'),
-                                onPressed: () =>
-                                    Navigator.pushNamed(context, '/reports'),
-                              ),
-                              const SizedBox(height: 16),
-                              Card(
-                                color: Colors.blue.shade50,
-                                child: Padding(
-                                  padding: const EdgeInsets.all(16),
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      const Text(
-                                        'LMS Analytics',
-                                        style: TextStyle(
-                                          fontWeight: FontWeight.bold,
-                                        ),
-                                      ),
-                                      const SizedBox(height: 8),
-                                      FutureBuilder<QuerySnapshot>(
-                                        future: FirebaseFirestore.instance
-                                            .collection('attendance')
-                                            .get(),
-                                        builder: (context, snapshot) {
-                                          if (snapshot.connectionState ==
-                                              ConnectionState.waiting) {
-                                            return const CircularProgressIndicator();
-                                          }
-                                          final records =
-                                              snapshot.data?.docs ?? [];
-                                          final totalAttendance =
-                                              records.length;
-                                          final uniqueStudents = <String>{};
-                                          for (final doc in records) {
-                                            final data =
-                                                doc.data()
-                                                    as Map<String, dynamic>;
-                                            if (data['userName'] != null)
-                                              uniqueStudents.add(
-                                                data['userName'],
-                                              );
-                                          }
-                                          return Column(
-                                            crossAxisAlignment:
-                                                CrossAxisAlignment.start,
-                                            children: [
-                                              Text(
-                                                'Total Attendance Records: $totalAttendance',
-                                              ),
-                                              Text(
-                                                'Unique Students Attended: ${uniqueStudents.length}',
-                                              ),
-                                              // Add more analytics as needed
-                                            ],
-                                          );
-                                        },
-                                      ),
-                                    ],
-                                  ),
-                                ),
+                              Text(
+                                'Method: ${record['method']?.toUpperCase() ?? 'Unknown'}',
                               ),
                             ],
                           ),
-                        ),
-                      );
-                    },
-                  ),
-                  const SizedBox(height: 16),
-                  FutureBuilder<QuerySnapshot>(
-                    future: FirebaseFirestore.instance
-                        .collection('attendance')
-                        .get(),
-                    builder: (context, attSnap) {
-                      if (attSnap.connectionState == ConnectionState.waiting) {
-                        return const Center(child: CircularProgressIndicator());
-                      }
-                      final records = attSnap.data?.docs ?? [];
-                      if (records.isEmpty) {
-                        return const Text('No attendance records found.');
-                      }
-                      final freq = <String, int>{};
-                      for (final doc in records) {
-                        final data = doc.data() as Map<String, dynamic>;
-                        final studentId =
-                            data['studentId'] ?? data['userId'] ?? data['id'];
-                        if (studentId != null) {
-                          freq[studentId] = (freq[studentId] ?? 0) + 1;
-                        }
-                      }
-                      return Card(
-                        color: Colors.orange.shade50,
-                        child: Padding(
-                          padding: const EdgeInsets.all(16),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
+                          trailing: Row(
+                            mainAxisSize: MainAxisSize.min,
                             children: [
-                              const Text(
-                                'Attendance Frequency per Student',
-                                style: TextStyle(fontWeight: FontWeight.bold),
-                              ),
-                              const SizedBox(height: 8),
-                              ...freq.entries.map(
-                                (e) => Text(
-                                  'Student ID: ${e.key}, Attendance Records: ${e.value}',
+                              Icon(Icons.check_circle, color: Colors.green),
+                              const SizedBox(width: 8),
+                              IconButton(
+                                icon: const Icon(
+                                  Icons.delete,
+                                  color: Colors.red,
                                 ),
+                                tooltip: 'Delete attendance record',
+                                onPressed: () =>
+                                    _deleteAttendance(recordId, studentName),
                               ),
                             ],
                           ),
@@ -828,109 +1003,22 @@ class ReportsScreen extends StatelessWidget {
                       );
                     },
                   ),
-                  const SizedBox(height: 16),
-                  Expanded(
-                    child: FutureBuilder<QuerySnapshot>(
-                      future: FirebaseFirestore.instance
-                          .collection('attendance')
-                          .get(),
-                      builder: (context, attSnap) {
-                        if (attSnap.connectionState ==
-                            ConnectionState.waiting) {
-                          return const Center(
-                            child: CircularProgressIndicator(),
-                          );
-                        }
-                        final records = attSnap.data?.docs ?? [];
-                        if (records.isEmpty) {
-                          return const Text('No attendance records found.');
-                        }
-                        return ListView.separated(
-                          itemCount: records.length,
-                          separatorBuilder: (_, __) => const Divider(),
-                          itemBuilder: (context, i) {
-                            final r = records[i].data() as Map<String, dynamic>;
-                            if (r['method'] != null && r['date'] != null) {
-                              return ListTile(
-                                leading: Icon(
-                                  (r['method'] ?? '') == 'barcode'
-                                      ? Icons.qr_code
-                                      : Icons.face,
-                                ),
-                                title: Text(
-                                  r['userName'] ??
-                                      r['studentName'] ??
-                                      r['name'] ??
-                                      '',
-                                ),
-                                subtitle: Text(
-                                  '${r['method'] ?? ''} | ${r['date'] ?? ''}',
-                                ),
-                              );
-                            } else {
-                              return const SizedBox.shrink();
-                            }
-                          },
-                        );
-                      },
-                    ),
-                  ),
-                ],
-              )
-            : FutureBuilder<QuerySnapshot>(
-                future: FirebaseFirestore.instance
-                    .collection('attendance')
-                    .where('userName', isEqualTo: userName)
-                    .get(),
-                builder: (context, attSnap) {
-                  if (attSnap.connectionState == ConnectionState.waiting) {
-                    return const Center(child: CircularProgressIndicator());
-                  }
-                  final records = attSnap.data?.docs ?? [];
-                  if (records.isEmpty) {
-                    return const Center(
-                      child: Text('No attendance records yet.'),
-                    );
-                  }
-                  return ListView.separated(
-                    itemCount: records.length,
-                    separatorBuilder: (_, __) => const Divider(),
-                    itemBuilder: (context, i) {
-                      final r = records[i].data() as Map<String, dynamic>;
-                      return ListTile(
-                        leading: Icon(
-                          (r['method'] ?? '') == 'barcode'
-                              ? Icons.qr_code
-                              : Icons.face,
-                        ),
-                        title: Text(
-                          r['userName'] ?? r['studentName'] ?? r['name'] ?? '',
-                        ),
-                        subtitle: Text(
-                          '${r['method'] ?? ''} | ${r['date'] ?? ''}',
-                        ),
-                      );
-                    },
-                  );
-                },
-              ),
+          ),
+        ],
       ),
     );
   }
 }
 
+// --- Settings Screen ---
 class SettingsScreen extends StatelessWidget {
-  const SettingsScreen({super.key});
+  const SettingsScreen({Key? key}) : super(key: key);
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('Settings')),
-      body: Center(
-        child: Text(
-          'Settings',
-          style: Theme.of(context).textTheme.headlineMedium,
-        ),
-      ),
+      body: const Center(child: Text('Settings features go here.')),
     );
   }
 }
